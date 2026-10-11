@@ -1,0 +1,38 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "joy-agent"
+version = "0.1.0"
+description = "A terminal coding agent scaffold."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "aisuite>=0.1.0",
+    "prompt-toolkit>=3.0.0",
+    "rich>=13.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "ruff>=0.6.0",
+]
+
+[project.scripts]
+joy = "joy_agent.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/joy_agent"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
