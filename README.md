@@ -2,9 +2,8 @@
 
 A starter project for a terminal-based coding agent.
 
-The project is intentionally small. It provides a terminal REPL that sends
-prompts to an LLM and renders responses as Markdown, with the package
-boundaries needed for future coding-agent behavior.
+The project is intentionally small. It provides a three-row terminal input
+for Joy and a Rich output area, ready for future coding-agent behavior.
 
 ## Requirements
 
@@ -17,29 +16,18 @@ boundaries needed for future coding-agent behavior.
 uv sync --extra dev
 ```
 
-## Configuration
-
-Set these variables when preparing to connect an LLM provider:
-
-```bash
-export JOY_AGENT_PROVIDER=openai
-export JOY_AGENT_MODEL=gpt-4o-mini
-```
-
-Provider credentials should use the environment variables expected by the
-selected provider's SDK, such as `OPENAI_API_KEY`. No credentials are stored
-in this repository.
-
 ## Run
 
 ```bash
 uv run joy
 ```
 
-The REPL accepts prompts until you enter `exit`, `quit`, Ctrl-D, or Ctrl-C.
-Conversation history is kept in memory for the current process. The current
-version does not execute tools, modify files, stream responses, or persist
-conversation history.
+The input has one blank gray row above and below the editable row. Press Enter
+to submit, Alt+Enter to insert a newline, Ctrl+C to cancel the current input,
+or Ctrl+D on an empty input to exit. Enter `/quit` or `/exit` to exit.
+
+Submitted text currently produces `Agent functionality is not connected yet.`
+No AI requests or coding tools are connected yet.
 
 ## Development
 

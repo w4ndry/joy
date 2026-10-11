@@ -1,15 +1,12 @@
-"""Command-line entry point for joy-agent."""
+"""Command-line entry point for joy."""
 
-from .config import Settings
-from .llm import LLMClient
 from .ui import run_repl
 
 
 def main() -> None:
-    """Start the joy-agent command."""
+    """Start the joy command."""
 
-    settings = Settings.from_environment()
-    run_repl(LLMClient(settings))
+    run_repl()
 
 
 if __name__ == "__main__":

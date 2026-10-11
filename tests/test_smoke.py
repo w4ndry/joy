@@ -1,10 +1,16 @@
 import io
 
+from prompt_toolkit.filters import Always
 from rich.console import Console
 
 from joy_agent.config import Settings
 from joy_agent.llm import LLMClient, model_name
-from joy_agent.ui import run_repl
+from joy_agent.ui import (
+    AGENT_NOT_CONNECTED,
+    INPUT_PLACEHOLDER,
+    create_prompt_session,
+    run_repl,
+)
 
 
 class FakeCompletions:
@@ -56,29 +62,42 @@ class FakeSession:
     def __init__(self, *inputs):
         self.inputs = iter(inputs)
 
-    def prompt(self, _prompt):
+    def prompt(self, *_args, **_kwargs):
         value = next(self.inputs)
         if isinstance(value, BaseException):
             raise value
         return value
 
 
-class FakeLLM:
-    def __init__(self):
-        self.inputs = []
+def test_prompt_layout_has_three_row_input_configuration():
+    session = create_prompt_session()
 
-    def send(self, user_input):
-        self.inputs.append(user_input)
-        return "**response**"
+    windows = list(
+        window
+        for window in session.layout.find_all_windows()
+        if getattr(window.content, "buffer", None) is session.default_buffer
+    )
+
+    assert "class:frame" in session.layout.container.style
+    assert session.color_depth.name == "DEPTH_24_BIT"
+    assert session.placeholder == [("class:placeholder", INPUT_PLACEHOLDER)]
+    assert windows
+    assert session.layout.container.height.min == 3
+    assert session.layout.container.height.max == 3
+    assert session.layout.container.height.preferred == 3
+    assert all(
+        window.height.min == 1
+        and window.height.max == 1
+        and window.height.preferred == 1
+        for window in windows
+    )
+    assert all(isinstance(window.dont_extend_height, Always) for window in windows)
 
 
-def test_repl_ignores_blank_input_and_exits():
-    llm = FakeLLM()
+def test_repl_prints_placeholder_response_and_exits():
     output = io.StringIO()
     console = Console(file=output, force_terminal=False)
 
-    run_repl(llm, FakeSession("", "hello", "quit"), console)
+    run_repl(FakeSession("", "hello", "/quit"), console)
 
-    assert llm.inputs == ["hello"]
-    assert "response" in output.getvalue()
-    assert "Goodbye!" in output.getvalue()
+    assert output.getvalue().count(AGENT_NOT_CONNECTED) == 1
