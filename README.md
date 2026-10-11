@@ -26,8 +26,10 @@ The input has one blank gray row above and below the editable row. Press Enter
 to submit, Alt+Enter to insert a newline, Ctrl+C to cancel the current input,
 or Ctrl+D on an empty input to exit. Enter `/quit` or `/exit` to exit.
 
-Submitted text currently produces `Agent functionality is not connected yet.`
-No AI requests or coding tools are connected yet.
+Submitted messages remain in terminal scrollback. Joy shows a simulated
+`Thinking…` indicator for 1.5 seconds, then displays a labeled demo response:
+`Agent functionality is not connected yet.` No AI requests or coding tools are
+connected yet.
 
 ## Development
 
