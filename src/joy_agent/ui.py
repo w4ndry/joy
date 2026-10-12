@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import queue
+import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 
@@ -43,6 +44,14 @@ class ChatState:
     generation_id: int = 0
     stream_handle: StreamHandle | None = None
     reply_task: asyncio.Task[None] | None = None
+    pending_user_text: str = ""
+    tool_statuses: list[tuple[str, str]] = None
+    tool_used: bool = False
+    interruption_recorded: bool = False
+
+    def __post_init__(self) -> None:
+        if self.tool_statuses is None:
+            self.tool_statuses = []
 
 
 def _input_key_bindings(state: ChatState) -> KeyBindings:
@@ -85,6 +94,10 @@ def _submit_buffer(event, state: ChatState) -> None:
     state.generation_id += 1
     state.pending = True
     state.preview_text = ""
+    state.pending_user_text = text
+    state.tool_statuses = []
+    state.tool_used = False
+    state.interruption_recorded = False
     state.stream_handle = state.llm.start_stream(
         state.llm.messages_for(text), state.generation_id
     )
@@ -100,6 +113,15 @@ def _cancel_pending(event, state: ChatState) -> None:
     partial = state.preview_text
     if state.stream_handle is not None:
         state.stream_handle.cancel()
+    commit_interruption = getattr(state.llm, "commit_interruption", None)
+    if (
+        state.tool_used
+        and not state.interruption_recorded
+        and state.pending_user_text
+        and callable(commit_interruption)
+    ):
+        commit_interruption(state.pending_user_text)
+        state.interruption_recorded = True
     state.generation_id += 1
     state.pending = False
     state.preview_text = ""
@@ -127,12 +149,42 @@ def _style() -> Style:
             "prompt": "fg:#ffffff bg:#393939",
             "thinking": "fg:#aaaaaa",
             "preview": "fg:#ffffff",
+            "tool": "fg:#aaaaaa",
         }
     )
 
 
 def _indented_lines(text: str) -> str:
     return "\n".join(f" {line}" for line in text.split("\n"))
+
+
+def _normalize_inline_bullets(text: str) -> str:
+    """Turn obvious inline capability lists into Markdown list items."""
+
+    lines: list[str] = []
+    list_open = False
+    for line in text.split("\n"):
+        if list_open and line.strip():
+            if lines and lines[-1] != "":
+                lines.append("")
+            list_open = False
+        if line.count(" - ") < 2 or not re.match(r"^\s*[^-\n]+:\s+-\s+", line):
+            lines.append(line)
+            continue
+        prefix, items_text = line.split(" - ", 1)
+        items = re.split(r"\s+-\s+", items_text)
+        lines.extend([prefix.rstrip(), "", *(f"- {item.strip()}" for item in items)])
+        list_open = True
+    if list_open and lines and lines[-1].startswith("-"):
+        lines.append("")
+    return "\n".join(lines)
+
+
+def _tool_status_text(state: ChatState) -> str:
+    if not state.tool_statuses:
+        return ""
+    name, status = state.tool_statuses[-1]
+    return f"  {name} · {status}"
 
 
 def create_prompt_session(state: ChatState | None = None) -> PromptSession[str]:
@@ -178,14 +230,32 @@ def create_prompt_session(state: ChatState | None = None) -> PromptSession[str]:
             ),
             height=Dimension(min=1, max=10),
             scroll_offsets=ScrollOffsets(bottom=0),
+            wrap_lines=True,
         ),
         filter=Condition(lambda: chat_state.pending and bool(chat_state.preview_text)),
+    )
+    tool_status = ConditionalContainer(
+        Window(
+            FormattedTextControl(
+                lambda: [
+                    (
+                        "class:tool",
+                        _tool_status_text(chat_state),
+                    )
+                ]
+            ),
+            height=Dimension.exact(1),
+            dont_extend_height=Always(),
+        ),
+        filter=Condition(lambda: chat_state.pending and bool(chat_state.tool_statuses)),
     )
     loading_gap = ConditionalContainer(
         Window(FormattedTextControl(""), height=1),
         filter=Condition(lambda: chat_state.pending),
     )
-    session.layout.container = HSplit([thinking, preview, loading_gap, input_frame])
+    session.layout.container = HSplit(
+        [thinking, preview, tool_status, loading_gap, input_frame]
+    )
     session.joy_state = chat_state
     session.joy_input_frame = input_frame
     return session
@@ -217,7 +287,8 @@ def render_user_message(text: str, console: Console | None = None) -> None:
 
 def render_markdown(text: str, console: Console | None = None) -> None:
     output = console if console is not None else Console()
-    output.print(Markdown(_indented_lines(text)))
+    formatted = _normalize_inline_bullets(text)
+    output.print(Markdown(formatted))
 
 
 def render_assistant_message(text: str, console: Console | None = None) -> None:
@@ -268,14 +339,35 @@ async def _stream_submission(app, state, user_text: str, console: Console) -> No
             if event.kind in {"text", "refusal"}:
                 state.preview_text += event.content
                 app.invalidate()
+            elif event.kind == "tool_started":
+                state.tool_used = True
+                state.tool_statuses = [(event.tool_name, "running")]
+                app.invalidate()
+            elif event.kind in {"tool_finished", "tool_failed"}:
+                status = "failed" if event.kind == "tool_failed" else "finished"
+                if state.tool_statuses:
+                    name, _ = state.tool_statuses[-1]
+                    if name == event.tool_name:
+                        state.tool_statuses = [(name, status)]
+                app.invalidate()
             elif event.kind == "complete":
                 response = state.preview_text
-                state.llm.commit_exchange(user_text, response)
+                history_items = getattr(event, "history_items", [])
+                try:
+                    state.llm.commit_exchange(user_text, response, history_items)
+                except TypeError:
+                    state.llm.commit_exchange(user_text, response)
                 await run_in_terminal(
                     lambda: render_assistant_message(response, console)
                 )
                 return
             elif event.kind == "error":
+                if (
+                    getattr(event, "tool_used", False)
+                    and not state.interruption_recorded
+                ):
+                    state.llm.commit_interruption(user_text)
+                    state.interruption_recorded = True
                 logger.error(
                     "Joy request error: %s",
                     _safe_error(event.error or RuntimeError("unknown provider error")),
@@ -285,6 +377,12 @@ async def _stream_submission(app, state, user_text: str, console: Console) -> No
                 )
                 return
             elif event.kind == "incomplete":
+                if (
+                    getattr(event, "tool_used", False)
+                    and not state.interruption_recorded
+                ):
+                    state.llm.commit_interruption(user_text)
+                    state.interruption_recorded = True
                 await _render_terminal_notice(
                     app,
                     console,
@@ -301,6 +399,10 @@ async def _stream_submission(app, state, user_text: str, console: Console) -> No
             state.stream_handle = None
         state.preview_text = ""
         state.pending = False
+        state.pending_user_text = ""
+        state.tool_statuses = []
+        state.tool_used = False
+        state.interruption_recorded = False
         state.reply_task = None
         app.invalidate()
 

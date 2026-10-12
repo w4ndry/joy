@@ -10,6 +10,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "aisuite[openai]>=0.1.0",
+    "openai>=1.109.1",
     "prompt-toolkit>=3.0.0",
     "rich>=13.0.0",
 ]

@@ -77,8 +77,17 @@ terminal scrollback, and the next draft can be edited while a response streams.
 Ctrl+C cancels UI delivery while preserving the draft; the in-flight request
 may continue in the background until its next chunk or the 60-second timeout.
 
-Joy does not read or edit files, execute tests, or persist conversations yet.
-The API key is read from the environment and is never stored by Joy.
+Joy can read and modify UTF-8 files and run relevant noninteractive checks with
+four tools: `read`, `write`, `edit`, and `bash`. File tools are restricted to
+the directory where Joy was launched, limit files to 2 MB, and use serialized,
+atomic mutations. `edit` requires one unique match and preserves the file's
+BOM and line-ending style. Joy asks the model to read before editing and to
+report tool failures honestly.
+
+`bash` runs with your normal user permissions in the launch directory. It is
+not sandboxed by Joy's file-path restrictions, so review commands before
+allowing them to run. Tool output is bounded for the model, and credentials
+are never included in logs or tool output.
 
 ## Development
 

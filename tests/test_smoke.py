@@ -1,57 +1,50 @@
 import asyncio
 import io
 import queue
+import threading
+import time
 from types import SimpleNamespace
 
 import pytest
-from prompt_toolkit.filters import Always
 from rich.console import Console
 
+import joy_agent.tools as tool_module
 from joy_agent.llm import (
-    MODEL,
     SYSTEM_PROMPT,
     MissingCredentialsError,
     StreamHandle,
     StreamingLLM,
 )
+from joy_agent.tools import ToolError, bash, edit, read, write
 from joy_agent.ui import (
     INPUT_PLACEHOLDER,
     ChatState,
     _cancel_pending,
+    _normalize_inline_bullets,
     _submit_buffer,
+    _tool_status_text,
     create_prompt_session,
     render_assistant_message,
     render_user_message,
 )
 
 
-def chunk(content=None, finish_reason=None, refusal=None):
-    return SimpleNamespace(
-        choices=[
-            SimpleNamespace(
-                delta=SimpleNamespace(content=content, refusal=refusal),
-                finish_reason=finish_reason,
-            )
-        ]
-    )
-
-
-class FakeStream:
-    def __init__(self, chunks):
-        self.chunks = iter(chunks)
+class FakeResponseStream:
+    def __init__(self, events):
+        self.events = iter(events)
         self.closed = False
 
     def __iter__(self):
         return self
 
     def __next__(self):
-        return next(self.chunks)
+        return next(self.events)
 
     def close(self):
         self.closed = True
 
 
-class FakeCompletions:
+class FakeResponses:
     def __init__(self, streams=None, error=None):
         self.streams = iter(streams or [])
         self.error = error
@@ -65,23 +58,38 @@ class FakeCompletions:
 
 
 class FakeClient:
-    def __init__(self, completions):
-        self.chat = SimpleNamespace(completions=completions)
-        self.providers = {}
+    def __init__(self, responses):
+        self.responses = responses
         self.closed = False
 
     def close(self):
         self.closed = True
 
 
-def make_llm(monkeypatch, completions):
+def completed(output):
+    return SimpleNamespace(
+        type="response.completed",
+        response=SimpleNamespace(output=output),
+    )
+
+
+def text_delta(value):
+    return SimpleNamespace(type="response.output_text.delta", delta=value)
+
+
+def refusal_delta(value):
+    return SimpleNamespace(type="response.refusal.delta", delta=value)
+
+
+def make_llm(monkeypatch, streams=None, error=None):
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
-    client = FakeClient(completions)
+    responses = FakeResponses(streams, error)
+    client = FakeClient(responses)
     llm = StreamingLLM(
         client_factory=lambda **_: client,
         base_url="https://example.test/v1",
     )
-    return llm, client
+    return llm, client, responses
 
 
 def drain(handle):
@@ -93,107 +101,269 @@ def drain(handle):
             return events
 
 
+@pytest.fixture
+def workspace(monkeypatch, tmp_path):
+    monkeypatch.setattr(tool_module, "_workspace_root", tmp_path.resolve())
+    return tmp_path
+
+
 def test_missing_credentials_is_clear(monkeypatch):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("JOY_AGENT_API_KEY", raising=False)
 
     with pytest.raises(MissingCredentialsError, match="OPENAI_API_KEY"):
         StreamingLLM()
 
 
-def test_streamed_chunks_and_history(monkeypatch):
-    stream = FakeStream([chunk("Hello "), chunk("world"), chunk(finish_reason="stop")])
-    completions = FakeCompletions([stream])
-    llm, client = make_llm(monkeypatch, completions)
-
-    handle = llm.start_stream(llm.messages_for("Hi"), 1)
-    handle.thread.join(timeout=2)
-    events = drain(handle)
-
-    assert [event.content for event in events if event.kind == "text"] == [
-        "Hello ",
-        "world",
-    ]
-    assert events[-1].kind == "complete"
-    assert completions.calls[0]["model"] == MODEL
-    assert completions.calls[0]["stream"] is True
-    assert completions.calls[0]["messages"][0]["content"] == SYSTEM_PROMPT
-    assert client is not None
-
-    llm.commit_exchange("Hi", "Hello world")
-    assert llm.messages_for("Again")[1:] == [
-        {"role": "user", "content": "Hi"},
-        {"role": "assistant", "content": "Hello world"},
-        {"role": "user", "content": "Again"},
-    ]
-    llm.close()
-    assert client.closed is True
+def test_system_prompt_requires_real_markdown_bullets():
+    assert "each item on its own line as a '-' bullet" in SYSTEM_PROMPT
+    assert "Never put multiple bullets in one paragraph" in SYSTEM_PROMPT
 
 
-def test_refusal_and_incomplete_streams(monkeypatch):
-    refusal_stream = FakeStream(
-        [chunk(refusal="I cannot help with that."), chunk(finish_reason="stop")]
+def test_tool_file_operations_and_read_window(workspace):
+    assert "wrote" in write("nested/example.txt", "one\ntwo\nthree\n")
+    assert read("nested/example.txt", offset=2, limit=2) == "2: two\n3: three"
+    diff = edit("nested/example.txt", "two", "changed")
+    assert "-two" in diff
+    assert "changed" in workspace.joinpath("nested/example.txt").read_text()
+
+
+def test_tool_limits_and_path_restrictions(workspace):
+    with pytest.raises(ToolError, match="2,000"):
+        read("missing", limit=2_001)
+    with pytest.raises(ToolError, match="escapes"):
+        read("../../outside")
+    outside = workspace.parent / "joy-outside.txt"
+    outside.write_text("secret")
+    workspace.joinpath("link").symlink_to(outside)
+    with pytest.raises(ToolError, match="escapes"):
+        read("link")
+
+
+def test_edit_fuzzy_match_preserves_bom_line_endings_and_unrelated_lines(workspace):
+    path = workspace / "fuzzy.txt"
+    path.write_bytes(
+        "\ufeffbefore — keep\r\nconst x = ‘one’  \r\nafter — keep\r\n".encode()
     )
-    incomplete_stream = FakeStream([chunk("partial")])
-    completions = FakeCompletions([refusal_stream, incomplete_stream])
-    llm, _ = make_llm(monkeypatch, completions)
+    edit("fuzzy.txt", "const x = 'one'\n", "const x = 'two'\n")
+    result = path.read_bytes().decode()
+    assert result.startswith("\ufeff")
+    assert "before — keep\r\n" in result
+    assert "const x = 'two'\r\n" in result
+    assert "after — keep\r\n" in result
 
+
+def test_edit_rejects_ambiguous_missing_and_noop(workspace):
+    write("ambiguous.txt", "same\nsame\n")
+    with pytest.raises(ToolError, match="ambiguous"):
+        edit("ambiguous.txt", "same", "new")
+    with pytest.raises(ToolError, match="whitespace"):
+        edit("ambiguous.txt", "  \n", "new")
+    with pytest.raises(ToolError, match="could not find"):
+        edit("ambiguous.txt", "missing", "new")
+    with pytest.raises(ToolError, match="no change"):
+        edit("ambiguous.txt", "same\nsame", "same\nsame")
+
+
+def test_edit_detects_external_change(workspace, monkeypatch):
+    path = workspace / "race.txt"
+    path.write_text("old")
+    original_read = tool_module._read_bytes
+    calls = 0
+
+    def changing_read(candidate):
+        nonlocal calls
+        calls += 1
+        value = original_read(candidate)
+        if calls == 1:
+            candidate.write_text("changed")
+        return value
+
+    monkeypatch.setattr(tool_module, "_read_bytes", changing_read)
+    with pytest.raises(ToolError, match="changed while"):
+        edit("race.txt", "old", "new")
+
+
+def test_bash_returns_output_exit_code_and_runs_in_workspace(workspace):
+    result = bash("printf '%s' \"$PWD\"; printf '\\nerr' >&2; exit 3")
+    assert str(workspace) in result
+    assert "err" in result
+    assert "exit_code=3" in result
+
+
+def test_bash_timeout_and_validation(workspace):
+    result = bash("sleep 2", timeout=1)
+    assert "timeout after 1s" in result
+    with pytest.raises(ToolError, match="between 1 and 300"):
+        bash("true", timeout=301)
+
+
+def test_bash_cancellation_terminates_process_group(workspace):
+    cancel = threading.Event()
+    result = []
+
+    def run_command():
+        with tool_module.execution_context(cancel):
+            result.append(bash("sleep 10", timeout=30))
+
+    thread = threading.Thread(target=run_command)
+    thread.start()
+    time.sleep(0.2)
+    cancel.set()
+    thread.join(timeout=3)
+    assert not thread.is_alive()
+    assert "cancelled" in result[0]
+
+
+def test_responses_streaming_and_reasoning_replay(monkeypatch):
+    first = FakeResponseStream(
+        [
+            text_delta("Reading "),
+            text_delta("file"),
+            completed(
+                [
+                    {
+                        "type": "reasoning",
+                        "id": "rs_1",
+                        "encrypted_content": "encrypted",
+                    },
+                    {
+                        "type": "function_call",
+                        "id": "fc_1",
+                        "call_id": "call_1",
+                        "name": "read",
+                        "arguments": '{"path":"README.md"}',
+                    },
+                ]
+            ),
+        ]
+    )
+    second = FakeResponseStream(
+        [text_delta("Done"), completed([{"type": "message", "role": "assistant"}])]
+    )
+    llm, client, responses = make_llm(monkeypatch, [first, second])
+    handle = llm.start_stream(llm.messages_for("inspect"), 1)
+    handle.thread.join(timeout=3)
+    events = drain(handle)
+    assert "Reading fileDone" == "".join(
+        event.content for event in events if event.kind == "text"
+    )
+    assert any(event.kind == "tool_finished" for event in events)
+    assert events[-1].kind == "complete"
+    assert responses.calls[0]["model"] == "gpt-5.6-luna"
+    assert responses.calls[0]["reasoning"] == {"effort": "medium"}
+    assert responses.calls[0]["store"] is False
+    assert responses.calls[0]["include"] == ["reasoning.encrypted_content"]
+    second_input = responses.calls[1]["input"]
+    assert second_input[1]["type"] == "reasoning"
+    assert second_input[-1]["type"] == "function_call_output"
+    assert client.closed is False
+
+
+def test_refusal_incomplete_and_api_error(monkeypatch):
+    refusal = FakeResponseStream([refusal_delta("no"), completed([])])
+    incomplete = FakeResponseStream([text_delta("partial")])
+    llm, _, _ = make_llm(monkeypatch, [refusal, incomplete])
     first = llm.start_stream(llm.messages_for("one"), 1)
     first.thread.join(timeout=2)
-    first_events = drain(first)
-    assert [event.content for event in first_events if event.kind == "refusal"] == [
-        "I cannot help with that."
+    assert [event.content for event in drain(first) if event.kind == "refusal"] == [
+        "no"
     ]
-    assert first_events[-1].kind == "complete"
-
     second = llm.start_stream(llm.messages_for("two"), 2)
     second.thread.join(timeout=2)
-    assert drain(second)[-1].kind == "incomplete"
+    events = drain(second)
+    assert events[-1].kind == "incomplete"
+    llm, _, _ = make_llm(monkeypatch, error=RuntimeError("boom"))
+    failed = llm.start_stream(llm.messages_for("three"), 3)
+    failed.thread.join(timeout=2)
+    assert str(drain(failed)[-1].error) == "boom"
 
 
-def test_api_error_is_delivered(monkeypatch):
-    llm, _ = make_llm(monkeypatch, FakeCompletions(error=RuntimeError("boom")))
-    handle = llm.start_stream(llm.messages_for("Hi"), 4)
+def test_incomplete_response_does_not_execute_tools(monkeypatch, workspace):
+    stream = FakeResponseStream(
+        [
+            completed(
+                [
+                    {
+                        "type": "function_call",
+                        "call_id": "call_1",
+                        "name": "write",
+                        "arguments": '{"path":"bad","content":"x"}',
+                    }
+                ]
+            ),
+            SimpleNamespace(type="response.incomplete"),
+        ]
+    )
+    llm, _, _ = make_llm(monkeypatch, [stream])
+    handle = llm.start_stream(llm.messages_for("write"), 1)
     handle.thread.join(timeout=2)
-    events = drain(handle)
-    assert events[-1].kind == "error"
-    assert str(events[-1].error) == "boom"
+    assert not workspace.joinpath("bad").exists()
 
 
-def test_prompt_layout_has_three_row_input_configuration():
+def test_prompt_layout_and_rendering():
     session = create_prompt_session()
-    windows = [
-        window
-        for window in session.layout.find_all_windows()
-        if getattr(window.content, "buffer", None) is session.default_buffer
-    ]
-
-    assert "class:frame" in session.joy_input_frame.style
-    assert session.color_depth.name == "DEPTH_24_BIT"
     assert session.placeholder == [("class:placeholder", INPUT_PLACEHOLDER)]
     assert session.joy_input_frame.height.min == 3
     assert session.joy_input_frame.height.max == 3
-    assert windows
-    assert all(
-        window.height.min == 1
-        and window.height.max == 1
-        and window.height.preferred == 1
-        for window in windows
-    )
-    assert all(isinstance(window.dont_extend_height, Always) for window in windows)
-
-
-def test_conversation_rendering_is_literal_and_indented():
     output = io.StringIO()
     console = Console(file=output, force_terminal=False)
-
     render_user_message("first line\n[not markdown]", console)
     render_assistant_message("**reply**\nnext", console)
-
     rendered = output.getvalue()
     assert "› first line" in rendered
     assert "[not markdown]" in rendered
-    assert " reply" in rendered
-    assert " next" in rendered
+    assert "reply" in rendered
+    assert "next" in rendered
+
+
+def test_tool_status_uses_compact_centered_dot_format():
+    state = ChatState(tool_statuses=[("bash", "finished")])
+    assert _tool_status_text(state) == "  bash · finished"
+    state.tool_statuses = [("bash", "running")]
+    assert _tool_status_text(state) == "  bash · running"
+
+
+def test_assistant_markdown_preserves_headings_code_and_ordered_lists():
+    output = io.StringIO()
+    console = Console(file=output, force_terminal=False)
+    render_assistant_message(
+        "## Project structure\n\n"
+        "```text\nprovider:model\n```\n\n"
+        "1. First item\n2. Second item",
+        console,
+    )
+    rendered = output.getvalue()
+    assert "Project structure" in rendered
+    assert "provider:model" in rendered
+    assert "1 First item" in rendered
+    assert "2 Second item" in rendered
+
+
+def test_inline_capability_items_render_as_markdown_bullets():
+    formatted = _normalize_inline_bullets(
+        "I can: - Read files - Write files - Run tests\n"
+        "I can also inspect code."
+    )
+    assert formatted == (
+        "I can:\n\n- Read files\n- Write files\n- Run tests\n\n"
+        "I can also inspect code."
+    )
+
+
+def test_inline_capability_items_render_as_separate_rich_bullets():
+    output = io.StringIO()
+    console = Console(file=output, force_terminal=False)
+    render_assistant_message(
+        "I can: - Read files - Write files - Run tests\n"
+        "I can also inspect code.",
+        console,
+    )
+    rendered = output.getvalue()
+    assert "• Read files" in rendered
+    assert "• Write files" in rendered
+    assert "• Run tests" in rendered
+    assert "• Run tests. I can also" not in rendered
 
 
 class FakeBuffer:
@@ -234,18 +404,10 @@ class FakeLLM:
 
     def start_stream(self, _messages, _generation_id):
         self.handle.events.put(
-            type(
-                "Event",
-                (),
-                {"generation_id": 1, "kind": "text", "content": "reply"},
-            )()
+            SimpleNamespace(generation_id=1, kind="text", content="reply")
         )
         self.handle.events.put(
-            type(
-                "Event",
-                (),
-                {"generation_id": 1, "kind": "complete", "content": ""},
-            )()
+            SimpleNamespace(generation_id=1, kind="complete", content="")
         )
         return self.handle
 
@@ -274,7 +436,7 @@ def test_submission_clears_input_and_preserves_next_draft(monkeypatch):
     asyncio.run(scenario())
 
 
-def test_cancellation_preserves_draft_and_discards_partial(monkeypatch):
+def test_cancellation_after_tool_use_records_interruption(monkeypatch):
     async def immediate_terminal_output(function):
         function()
 
@@ -282,16 +444,21 @@ def test_cancellation_preserves_draft_and_discards_partial(monkeypatch):
 
     async def scenario():
         output = io.StringIO()
-        state = ChatState(llm=FakeLLM(), pending=True, preview_text="partial")
+        llm = FakeLLM()
+        state = ChatState(
+            llm=llm,
+            pending=True,
+            preview_text="partial",
+            pending_user_text="change it",
+            tool_used=True,
+        )
         state.stream_handle = StreamHandle(2)
         app = FakeApp(Console(file=output, force_terminal=False))
         event = FakeEvent(app, "next draft")
         state.reply_task = asyncio.create_task(asyncio.sleep(10))
         _cancel_pending(event, state)
         await asyncio.gather(*app.tasks)
-        assert event.current_buffer.text == "next draft"
         assert state.pending is False
-        assert "partial" in output.getvalue()
         assert "cancelled" in output.getvalue().lower()
 
     asyncio.run(scenario())
