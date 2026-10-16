@@ -3,28 +3,47 @@ import io
 import queue
 import threading
 import time
+from datetime import datetime
 from types import SimpleNamespace
 
 import pytest
 from rich.console import Console
 
 import joy_agent.tools as tool_module
+import joy_agent.ui as ui_module
 from joy_agent.llm import (
     SYSTEM_PROMPT,
     MissingCredentialsError,
     StreamHandle,
     StreamingLLM,
 )
-from joy_agent.tools import ToolError, bash, edit, read, write
+from joy_agent.tools import (
+    FileChange,
+    ToolError,
+    bash,
+    edit,
+    execution_context,
+    read,
+    write,
+)
 from joy_agent.ui import (
     INPUT_PLACEHOLDER,
     ChatState,
     _cancel_pending,
     _normalize_inline_bullets,
+    _render_change_lines,
     _submit_buffer,
     _tool_status_text,
     create_prompt_session,
     render_assistant_message,
+    render_code_preview,
+    render_file_changes,
+    render_persistent_summary,
+    render_pretty,
+    render_syntax,
+    render_table,
+    render_tool_completion,
+    render_tool_elapsed,
     render_user_message,
 )
 
@@ -126,6 +145,18 @@ def test_tool_file_operations_and_read_window(workspace):
     diff = edit("nested/example.txt", "two", "changed")
     assert "-two" in diff
     assert "changed" in workspace.joinpath("nested/example.txt").read_text()
+
+
+def test_file_mutations_capture_text_changes_for_the_ui(workspace):
+    cancel = threading.Event()
+    with execution_context(cancel) as context:
+        write("new.txt", "first\nsecond\n")
+    assert context.changes == [FileChange("new.txt", None, "first\nsecond\n")]
+
+    workspace.joinpath("existing.txt").write_text("before\n")
+    with execution_context(cancel) as context:
+        write("existing.txt", "after\n")
+    assert context.changes == [FileChange("existing.txt", "before\n", "after\n")]
 
 
 def test_tool_limits_and_path_restrictions(workspace):
@@ -248,6 +279,9 @@ def test_responses_streaming_and_reasoning_replay(monkeypatch):
     assert "Reading fileDone" == "".join(
         event.content for event in events if event.kind == "text"
     )
+    started = next(event for event in events if event.kind == "tool_started")
+    assert started.tool_action == "Reading"
+    assert started.tool_target == "README.md"
     assert any(event.kind == "tool_finished" for event in events)
     assert events[-1].kind == "complete"
     assert responses.calls[0]["model"] == "gpt-5.6-luna"
@@ -318,10 +352,39 @@ def test_prompt_layout_and_rendering():
 
 
 def test_tool_status_uses_compact_centered_dot_format():
-    state = ChatState(tool_statuses=[("bash", "finished")])
-    assert _tool_status_text(state) == "  bash · finished"
-    state.tool_statuses = [("bash", "running")]
-    assert _tool_status_text(state) == "  bash · running"
+    state = ChatState(
+        tool_statuses=[("bash", "running")],
+        tool_started_at=10.0,
+    )
+    original_monotonic = ui_module.time.monotonic
+    ui_module.time.monotonic = lambda: 12.4
+    try:
+        assert _tool_status_text(state) == "  Working (2s)"
+    finally:
+        ui_module.time.monotonic = original_monotonic
+
+    state = ChatState(
+        tool_statuses=[("bash", "finished")],
+        tool_elapsed=4.2,
+        tool_finished_at=datetime(2026, 10, 16, 20, 7),
+    )
+    assert _tool_status_text(state) == "  Worked for 4s · 20:07"
+
+
+def test_tool_elapsed_is_persistent_below_completion_summary():
+    output = io.StringIO()
+    console = Console(file=output, record=True, force_terminal=False)
+    render_persistent_summary("Done. Changed the file.", console, leading_blank=True)
+    render_tool_elapsed(16.2, datetime(2026, 10, 16, 21, 28), console=console)
+
+    lines = console.export_text(clear=False).splitlines()
+    assert lines == [
+        "",
+        "• Done. Changed the file.",
+        "",
+        "  Worked for 16s · 21:28",
+        "",
+    ]
 
 
 def test_assistant_markdown_preserves_headings_code_and_ordered_lists():
@@ -338,6 +401,113 @@ def test_assistant_markdown_preserves_headings_code_and_ordered_lists():
     assert "provider:model" in rendered
     assert "1 First item" in rendered
     assert "2 Second item" in rendered
+
+
+def test_rich_syntax_and_code_preview_render_line_numbers_and_source():
+    output = io.StringIO()
+    console = Console(file=output, record=True, force_terminal=False)
+    render_syntax("def greet():\n    return 'hello'", "python", console)
+    render_code_preview('{"ok": true}', "result.json", console)
+
+    rendered = console.export_text(clear=False)
+    assert "1 def greet():" in rendered
+    assert "2     return 'hello'" in rendered
+    assert '1 {"ok": true}' in rendered
+
+
+def test_rich_pretty_and_table_render_structured_values():
+    output = io.StringIO()
+    console = Console(file=output, record=True, force_terminal=False)
+    render_pretty({"files": ["one.py", "two.py"], "count": 2}, console)
+    render_table(
+        ["File", "Status"],
+        [["one.py", "added"], ["two.py", "edited"]],
+        title="Changes",
+        console=console,
+    )
+
+    rendered = console.export_text(clear=False)
+    assert "files" in rendered
+    assert "one.py" in rendered
+    assert "Changes" in rendered
+    assert "Status" in rendered
+    assert "edited" in rendered
+
+
+def test_rich_table_rejects_rows_with_wrong_width():
+    with pytest.raises(ValueError, match="row width"):
+        render_table(["File", "Status"], [["one.py"]])
+
+
+def test_file_change_rendering_highlights_lines_and_changed_text():
+    change = FileChange(
+        "demo.py",
+        "keep\nprefix old suffix\nremoved\nend\n",
+        "keep\nprefix new suffix\nend\nadded\n",
+    )
+    rows = _render_change_lines(change, 40)
+    assert [row.plain for row in rows] == [
+        "2 - prefix old suffix" + " " * 19,
+        "2 + prefix new suffix" + " " * 19,
+        "3 - removed" + " " * 29,
+        "4 + added" + " " * 31,
+    ]
+    assert len(rows[0].plain) == 40
+    assert str(rows[0].spans[0].style) == "#858b98 on #452c30"
+    assert str(rows[0].spans[1].style) == "#d9a0a5 on #452c30"
+    assert str(rows[1].spans[0].style) == "#858b98 on #263d30"
+    assert any(
+        str(span.style) == "#9cb9d8 on #263d30" for span in rows[1].spans[1:]
+    )
+
+    output = io.StringIO()
+    console = Console(file=output, record=True, force_terminal=False, width=40)
+    render_file_changes([change], console)
+    plain = console.export_text(clear=False)
+    styled = console.export_text(clear=False, styles=True)
+    assert "demo.py" in plain
+    assert "new" in plain
+    assert "removed" in plain
+    assert "added" in plain
+    assert "• Edited demo.py (+2, -2)" in plain
+    assert "\x1b[38;2;217;160;165;48;2;69;44;48m-" in styled
+    assert "\x1b[38;2;217;160;165;48;2;69;44;48m" in styled
+    assert "\x1b[38;2;163;201;168;48;2;38;61;48m+" in styled
+    assert "\x1b[38;2;163;201;168;48;2;38;61;48madded" in styled
+
+
+def test_persistent_summaries_and_failure_lines_are_readable():
+    output = io.StringIO()
+    console = Console(file=output, record=True, force_terminal=False)
+    render_persistent_summary("I’ll edit test.md.", console)
+    render_tool_completion("Editing", "test.md", console=console, success=False)
+    plain = console.export_text(clear=False)
+    styled = console.export_text(clear=False, styles=True)
+    assert "• I’ll edit test.md." in plain
+    assert "• Failed — editing test.md" in plain
+    assert "• I’ll edit test.md.\n\n" in plain
+    assert "\x1b[38;2;133;139;152;48;2;30;30;36m•" in styled
+    assert "\x1b[38;2;197;203;211;48;2;30;30;36m" in styled
+
+
+def test_tool_activity_spacing_places_completion_directly_after_diff():
+    output = io.StringIO()
+    console = Console(file=output, record=True, force_terminal=False, width=32)
+    change = FileChange("test.md", "old\n", "new\n")
+
+    render_persistent_summary("I’ll edit test.md.", console)
+    render_file_changes([change], console)
+    render_persistent_summary("Edited test.md.", console, leading_blank=True)
+
+    plain = console.export_text(clear=False)
+    lines = plain.splitlines()
+    assert lines[0] == "• I’ll edit test.md."
+    assert lines[1] == ""
+    assert lines[2] == "• Edited test.md (+1, -1)"
+    assert lines[4].startswith("1 + new")
+    assert lines[5] == ""
+    assert lines[6] == "• Edited test.md."
+    assert lines[7] == ""
 
 
 def test_inline_capability_items_render_as_markdown_bullets():

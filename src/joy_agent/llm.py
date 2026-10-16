@@ -14,7 +14,7 @@ from typing import Any, Literal
 
 from openai import OpenAI
 
-from .tools import TOOL_DEFINITIONS, TOOL_REGISTRY, execution_context
+from .tools import TOOL_DEFINITIONS, TOOL_REGISTRY, FileChange, execution_context
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +64,9 @@ class StreamEvent:
     tool_name: str = ""
     history_items: list[dict[str, Any]] = field(default_factory=list)
     tool_used: bool = False
+    changes: list[FileChange] = field(default_factory=list)
+    tool_action: str = ""
+    tool_target: str = ""
 
 
 class StreamHandle:
@@ -341,16 +344,23 @@ class StreamingLLM:
                 return results
             name = str(call.get("name", "unknown"))
             call_id = str(call.get("call_id", call.get("id", "")))
+            arguments = call.get("arguments", "{}")
+            tool_action, tool_target = _tool_display_metadata(name, arguments)
             handle.events.put(
-                StreamEvent(handle.generation_id, "tool_started", tool_name=name)
+                StreamEvent(
+                    handle.generation_id,
+                    "tool_started",
+                    tool_name=name,
+                    tool_action=tool_action,
+                    tool_target=tool_target,
+                )
             )
             try:
-                arguments = call.get("arguments", "{}")
                 chat_call = {
                     "id": call_id,
                     "function": {"name": name, "arguments": arguments},
                 }
-                with execution_context(handle.cancel_event):
+                with execution_context(handle.cancel_event) as context:
                     value = TOOL_REGISTRY.execute([chat_call])[0]
                 result = str(value)
                 results.append(
@@ -361,7 +371,14 @@ class StreamingLLM:
                     }
                 )
                 handle.events.put(
-                    StreamEvent(handle.generation_id, "tool_finished", tool_name=name)
+                    StreamEvent(
+                        handle.generation_id,
+                        "tool_finished",
+                        tool_name=name,
+                        tool_action=tool_action,
+                        tool_target=tool_target,
+                        changes=list(context.changes),
+                    )
                 )
             except Exception as error:
                 message = _safe_error(error)
@@ -377,6 +394,8 @@ class StreamingLLM:
                         handle.generation_id,
                         "tool_failed",
                         tool_name=name,
+                        tool_action=tool_action,
+                        tool_target=tool_target,
                         content=message,
                         error=error,
                     )
@@ -399,6 +418,25 @@ class StreamingLLM:
             return
         self._closed = True
         _close_client(self.client)
+
+
+def _tool_display_metadata(name: str, arguments: Any) -> tuple[str, str]:
+    actions = {
+        "read": "Reading",
+        "write": "Writing",
+        "edit": "Editing",
+        "bash": "Running",
+    }
+    target = ""
+    parsed = arguments
+    if isinstance(arguments, str):
+        try:
+            parsed = json.loads(arguments)
+        except (TypeError, ValueError):
+            parsed = {}
+    if isinstance(parsed, dict):
+        target = str(parsed.get("path", "") or "")
+    return actions.get(name, name.capitalize()), target
 
 
 def _copy_item(item: Any) -> dict[str, Any]:

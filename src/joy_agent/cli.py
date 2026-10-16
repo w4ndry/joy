@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 
 from rich.console import Console
+from rich.text import Text
 
 from .llm import MODEL, MissingCredentialsError, StreamingLLM
 from .ui import run_repl
@@ -69,7 +70,9 @@ def main() -> None:
     try:
         llm = StreamingLLM(model=args.model, base_url=args.base_url)
     except MissingCredentialsError as error:
-        console.print(f"[red]Setup required:[/red] {error}")
+        message = Text("Setup required: ", style="red")
+        message.append(str(error))
+        console.print(message)
         return
     run_repl(llm, console=console)
 

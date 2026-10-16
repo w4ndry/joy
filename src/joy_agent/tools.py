@@ -12,7 +12,7 @@ import tempfile
 import threading
 import time
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterator
 
@@ -31,6 +31,7 @@ _mutation_lock = threading.RLock()
 class _ExecutionContext:
     cancel_event: threading.Event
     active_process: subprocess.Popen[str] | None = None
+    changes: list[FileChange] = field(default_factory=list)
 
 
 _execution_context: contextvars.ContextVar[_ExecutionContext | None] = (
@@ -40,6 +41,15 @@ _execution_context: contextvars.ContextVar[_ExecutionContext | None] = (
 
 class ToolError(ValueError):
     """An expected, model-visible tool failure."""
+
+
+@dataclass(frozen=True)
+class FileChange:
+    """Text content changed by a successful file mutation."""
+
+    path: str
+    before: str | None
+    after: str
 
 
 def _bounded(value: str) -> str:
@@ -103,6 +113,14 @@ def _write_atomic(path: Path, data: bytes, mode: int | None = None) -> None:
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def _record_change(path: Path, before: str | None, after: str) -> None:
+    context = _execution_context.get()
+    if context is None or before == after:
+        return
+    relative_path = path.relative_to(_workspace_root).as_posix()
+    context.changes.append(FileChange(relative_path, before, after))
 
 
 def _normalize_line_endings(text: str) -> str:
@@ -257,8 +275,19 @@ def write(path: str, content: str) -> str:
     with _mutation_lock:
         if resolved.is_symlink():
             raise ToolError("refusing to overwrite a symlink")
+        context = _execution_context.get()
+        before: str | None = None
+        can_record_change = context is not None and not resolved.exists()
+        if context is not None and resolved.exists():
+            try:
+                _, before = _decode(_read_bytes(resolved))
+                can_record_change = True
+            except ToolError:
+                can_record_change = False
         mode = resolved.stat().st_mode & 0o7777 if resolved.exists() else None
         _write_atomic(resolved, encoded, mode)
+        if can_record_change:
+            _record_change(resolved, before, content)
     return _bounded(f"wrote {len(encoded)} bytes to {path}")
 
 
@@ -284,6 +313,7 @@ def edit(path: str, old_text: str, new_text: str) -> str:
             raise ToolError("result exceeds the 2 MB tool limit")
         mode = resolved.stat().st_mode & 0o7777
         _write_atomic(resolved, encoded, mode)
+        _record_change(resolved, before, after)
     return _bounded(_diff(resolved, before, after))
 
 
@@ -345,11 +375,12 @@ def bash(command: str, timeout: int = 30) -> str:
 
 
 @contextlib.contextmanager
-def execution_context(cancel_event: threading.Event) -> Iterator[None]:
+def execution_context(cancel_event: threading.Event) -> Iterator[_ExecutionContext]:
     """Expose cancellation to tools while AISuite executes them."""
-    token = _execution_context.set(_ExecutionContext(cancel_event))
+    context = _ExecutionContext(cancel_event)
+    token = _execution_context.set(context)
     try:
-        yield
+        yield context
     finally:
         _execution_context.reset(token)
 
